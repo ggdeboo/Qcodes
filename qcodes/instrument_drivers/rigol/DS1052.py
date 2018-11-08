@@ -10,8 +10,10 @@ from distutils.version import LooseVersion
 log = logging.getLogger(__name__)
 
 class ScopeArray(ArrayParameter):
+    """Parameter to read out a waveform from the oscilloscope."""
     def __init__(self, name, instrument, channel, raw=False):
         super().__init__(name=name,
+                         instrument=instrument,
                          shape=(1400,),
                          label='Voltage',
                          unit='V',
@@ -27,27 +29,56 @@ class ScopeArray(ArrayParameter):
         else:
             self.chan_str = channel # MATH or FFT
 
-        self._instrument = instrument
         self.raw = raw
         self.max_read_step = 50
         self.trace_ready = False
 
-    def get_raw(self):
+    def get_raw(self, return_int=False):
         """Get the waveform data from the oscilloscope.
         
         Returns:
             data (numpy.array):
+
+        Notes:
+            The number of points depends on the run mode.
         """
-        self._instrument.write(':WAV:DATA? {0}'.format(self.chan_str))
-        wvf_data = self._instrument._parent.visa_handle.read_raw()
-        data_raw = np.frombuffer(wvf_data[10:], dtype=np.uint8).astype(float)
+        self.instrument.write(':WAV:DATA? {0}'.format(self.chan_str))
+        wvf_data = self.instrument._parent.visa_handle.read_raw()
+        data_raw = np.frombuffer(wvf_data[10:], dtype=np.uint8)
+
+        if return_int:
+            return data_raw
+
         if self.chan_str in ['CHAN1', 'CHAN2']:
-            data = -1*((data_raw - data_raw[0] + self.instrument.vertical_offset())*self.instrument.vertical_scale())
-            print(max(data) - min(data))
-            #print(data_raw)
+            midpoint = 125
+            points_per_division = 256/10
+            vscale = self.instrument.vertical_scale()
+            data = -1.0*(data_raw.astype(float) - midpoint) / points_per_division * vscale
             return data
         else:
             return data_raw
+
+    def trace_length(self) -> int:
+        """Determine the trace length based on instrument settings."""
+        if self.instrument._parent.waveform_points_mode() == 'MAXIMUM':
+            if self.instrument._parent.trigger_status() == 'STOP':
+                points_mode='RAW'
+            else:
+                points_mode='NORMAL'
+
+        if points_mode == 'RAW':
+            if self.instrument._parent.acquire_mem_depth() == 'LONG':
+                if self.instrument._parent.half_channel():
+                    return 1048576
+                else:
+                    return 524288
+            else:
+                if self.instrument._parent.half_channel():
+                    return 8192
+                else:
+                    return 16384
+        else:
+            return 600
 
 class RigolDS1000Channel(InstrumentChannel):
 
@@ -60,14 +91,22 @@ class RigolDS1000Channel(InstrumentChannel):
         else:
             self.chan_str = channel # MATH or FFT
 
+        self.add_parameter("coupling",
+                            label="Input Coupling",
+                            get_cmd=":CHAN{}:COUP?".format(channel),
+                            set_cmd=":CHAN{}:COUP {}".format(channel, "{}"),
+                            post_delay=0.2,
+                            )
         self.add_parameter("amplitude",
                            get_cmd=":MEASure:VAMP? chan{}".format(channel),
-                           get_parser = float
+                           get_parser = float,
+                           unit='V',
                           )
         self.add_parameter("vertical_scale",
                            get_cmd=":CHANnel{}:SCALe?".format(channel),
                            set_cmd=":CHANnel{}:SCALe {}".format(channel, "{}"),
-                           get_parser=float
+                           get_parser=float,
+                           unit='V',
                           )
         if self.chan_str == 'FFT':
             self.add_parameter("display",
@@ -80,8 +119,9 @@ class RigolDS1000Channel(InstrumentChannel):
             self.add_parameter("display",
                             get_cmd=":{}:DISP?".format(self.chan_str),
                             set_cmd=":{}:DISP {}".format(self.chan_str, "{}"),
-                            get_parser = bool,
-                            set_parser = int)
+                            val_mapping={False : '0',
+                                       True : '1',
+                                       })
         self.add_parameter("vertical_offset",
                             get_cmd = ":CHAN{}:OFFS?".format(channel),
                             set_cmd = ":CHAN{}:OFFS {}".format(channel, "{}"),
@@ -102,6 +142,9 @@ class RigolDS1000Channel(InstrumentChannel):
                     )
 
         # Return the waveform displayed on the screen
+        self.add_parameter('memory_depth',
+                    get_cmd=':CHAN{}:MEMD?'.format(channel),
+                    get_parser=int)
         self.add_parameter('waveform_data',
                            channel=channel,
                            parameter_class=ScopeArray,
@@ -140,7 +183,7 @@ class RigolDS1000(VisaInstrument):
                 label="the average number in averages mode",
                 get_cmd=':ACQ:AVER?',
                 set_cmd=':ACQ:AVER {}',
-                vals=vals.Enum('2', '4', '8', '16', '32', '64', '128', '256'))
+                vals=vals.Enum(2, 4, 8, 16, 32, 64, 128, 256))
         self.add_parameter("acquire_mem_depth",
                 label='depth of memory being used by oscilloscope',
                 get_cmd=':ACQ:MEMDepth?',
@@ -242,17 +285,13 @@ class RigolDS1000(VisaInstrument):
                 label="sets and queries the trigger source",
                 get_cmd = ":TRIG:{}:SOUR?".format(self.trigger_mode()),
                 set_cmd = ":TRIG:{}:SOUR {}".format(self.trigger_mode(), "{}")
-                #get_cmd = self.source_get_cmd,
-                #set_cmd = self.source_set_cmd,
                 )
         self.add_parameter("trigger_level",
                 label="sets and queries the trigger level",
                 get_cmd=":TRIG:{}:LEV?".format(self.trigger_mode()),
                 set_cmd=":TRIG:{}:LEV {}".format(self.trigger_mode(), "{}"),
-                #get_cmd = self.level_get_cmd,
                 get_parser = float,
-                #set_cmd = self.level_set_cmd,
-                unit = "V"
+                unit = "V",
                 #vals = vals.permissiveInts(-6*#vertical scale, 6*#vertical scale())
                 )
         self.add_parameter("trigger_sweep",
@@ -276,6 +315,9 @@ class RigolDS1000(VisaInstrument):
                 get_parser = float,
                 unit = 's'
                )
+        self.add_parameter("trigger_status",
+                label="Trigger Status",
+                get_cmd=":TRIG:STAT?")
 
         # Waveform
         self.add_parameter("waveform_points_mode",
@@ -288,16 +330,23 @@ class RigolDS1000(VisaInstrument):
 
     def run(self):
         """Start the acquisition."""
-        self.visa_handle.write(':RUN')
+        self.write(':RUN')
 
     def stop(self):
         """Stop the acquisition."""
-        self.visa_handle.write(':STOP')
+        self.write(':STOP')
 
     def single(self):
         """Single trace acquisition."""
-        self.visa_handle.write(':SINGle')
+        self.write(':SINGle')
 
     def force_trigger(self):
         """Force trigger event."""
-        self.visa_handle.write('TFORce')
+        self.write('TFORce')
+
+    def beep(self):
+        self.write(':BEEP:ACT')
+
+    def half_channel(self):
+        """Determine whether the instrument is operating in half channel mode."""
+        return (self.channels.ch1.display() != self.channels.ch2.display())
